@@ -1,9 +1,0 @@
-    train: D:/jyy/academy/(2025-2026-1)-ICE2607-01/CCPD2019/images/train
-    val: D:/jyy/academy/(2025-2026-1)-ICE2607-01/CCPD2019/images/val
-
-    # Number of classes
-    nc: 1
-
-    # Class names
-    names: ['license_plate']
-    

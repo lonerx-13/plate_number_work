@@ -1,0 +1,12 @@
+path: ccpd_pose_dataset
+train: images/train
+val: images/val
+
+# Keypoints
+kpt_shape: [4, 3]  # 4 keypoints (TL, TR, BR, BL), 3 dims (x, y, visibility)
+flip_idx: [1, 0, 3, 2] # 左右翻转时的索引变换 (TL<->TR, BL<->BR)
+
+# Classes
+nc: 1
+names:
+  0: license_plate
