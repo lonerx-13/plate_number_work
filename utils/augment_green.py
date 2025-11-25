@@ -67,7 +67,7 @@ def generate_augmented_data(src_dir, dst_dir):
         
         # 1. 保存到 color_dataset (用于ColorNet训练)
         cv2.imencode('.jpg', img_yellow)[1].tofile(os.path.join(dst_dir, 'yellow', f"yellow_{filename}"))
-        cv2.imencode('.jpg', img_green)[1].tofile(os.path.join(dst_dir, 'green', f"green_{filename}"))
+        # cv2.imencode('.jpg', img_green)[1].tofile(os.path.join(dst_dir, 'green', f"green_{filename}"))
         
         # 2. 保存回 lpr_dataset (用于LPRNet混合训练)
         # 保持标签在文件名前缀: Label_AugType_OrigName.jpg
@@ -81,8 +81,8 @@ def generate_augmented_data(src_dir, dst_dir):
         cv2.imencode('.jpg', img_yellow)[1].tofile(os.path.join(src_dir, yellow_name))
         
         # 绿色车牌 (黑字)
-        green_name = f"{label}_green_{rest}"
-        cv2.imencode('.jpg', img_green)[1].tofile(os.path.join(src_dir, green_name))
+        # green_name = f"{label}_green_{rest}"
+        # cv2.imencode('.jpg', img_green)[1].tofile(os.path.join(src_dir, green_name))
 
 if __name__ == "__main__":
     # 假设你已经运行了 lprnet/ccpd_to_lpr.py 生成了 lpr_dataset

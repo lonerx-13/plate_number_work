@@ -156,12 +156,11 @@ class App:
         img_cv = cv2.imdecode(np.fromfile(self.current_image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
         results = self.yolo_model(img_cv)
         result = results[0]
-        
-        if result.keypoints is None:
-            self.txt_result.insert(tk.END, "未检测到车牌关键点\n")
-            return
-            
+
         keypoints = result.keypoints.xy.cpu().numpy()
+        if len(keypoints) == 0:
+            self.txt_result.insert(tk.END, "未检测到车牌\n")
+            return
         
         self.txt_result.delete(1.0, tk.END)
         

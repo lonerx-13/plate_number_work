@@ -20,8 +20,8 @@ def train_lpr(resume=False, weights=None):
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # 数据集
-    # train_dir = 'lpr_dataset/train'
-    train_dir = 'lpr_dataset/val'
+    train_dir = 'lpr_dataset/train'
+    # train_dir = 'lpr_dataset/val'
     
     if not os.path.exists(train_dir):
         print(f"错误: 找不到数据集 {train_dir}")
