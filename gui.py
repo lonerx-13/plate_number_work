@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 import cv2
 import numpy as np
@@ -9,6 +9,10 @@ import torch
 from ultralytics import YOLO
 from lprnet.model import LPRNet, CHARS
 from colornet.model import ColorNet
+from template_match.recognizer import TemplateRecognizer, SegmentMethod
+from template_match.segment_v3 import segment_with_fallback
+from template_match.segment_lpr import split_char
+from cnn_classifier import CNNCharRecognizer
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -46,7 +50,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("车牌识别系统 (大作业)")
-        self.root.geometry("1000x700")
+        self.root.geometry("1200x750")
         
         # 模型加载
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -99,6 +103,24 @@ class App:
             else:
                 print("警告: 未找到ColorNet模型，颜色识别将使用HSV兜底")
                 self.color_model = None
+            
+            # HOG 特征识别器（延迟加载）
+            template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "character")
+            self.template_dir = template_dir
+            self.template_recognizer_deep = None  # 延迟加载 HOG 特征版本
+            if os.path.exists(template_dir):
+                print("字符模板目录已找到，HOG 识别器将延迟加载")
+            else:
+                print("警告: 未找到字符模板目录，HOG 识别不可用")
+            
+            # CNN 字符分类器
+            checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+            if os.path.exists(checkpoint_dir):
+                self.cnn_recognizer = CNNCharRecognizer(checkpoint_dir)
+                print("CNN 字符分类器已加载")
+            else:
+                self.cnn_recognizer = None
+                print("警告: 未找到 checkpoints 目录，CNN 分类不可用")
                 
         except Exception as e:
             messagebox.showerror("错误", f"模型加载失败: {e}")
@@ -110,6 +132,34 @@ class App:
         
         tk.Button(btn_frame, text="选择图片", command=self.load_image, width=15, height=2).pack(side=tk.LEFT, padx=10)
         tk.Button(btn_frame, text="开始识别", command=self.process_image, width=15, height=2).pack(side=tk.LEFT, padx=10)
+        
+        # 识别方法选择
+        method_frame = tk.Frame(btn_frame)
+        method_frame.pack(side=tk.LEFT, padx=20)
+        tk.Label(method_frame, text="识别方法:").pack(side=tk.LEFT)
+        self.recognition_method = tk.StringVar(value="lprnet")
+        method_combo = ttk.Combobox(method_frame, textvariable=self.recognition_method, 
+                                     values=["lprnet", "cnn_resnet18",
+                                             "hog_euclidean", "hog_cosine"],
+                                     state="readonly", width=18)
+        method_combo.pack(side=tk.LEFT, padx=5)
+        
+        # 分割方法选择
+        seg_frame = tk.Frame(btn_frame)
+        seg_frame.pack(side=tk.LEFT, padx=10)
+        tk.Label(seg_frame, text="分割方法:").pack(side=tk.LEFT)
+        self.segmentation_method = tk.StringVar(value="v3_fallback")
+        seg_combo = ttk.Combobox(seg_frame, textvariable=self.segmentation_method,
+                                  values=["v3_fallback", "lpr"],
+                                  state="readonly", width=12)
+        seg_combo.pack(side=tk.LEFT, padx=5)
+        
+        # 添加分割方法说明的提示
+        seg_tip = tk.Label(seg_frame, text="(?)", fg="blue", cursor="hand2")
+        seg_tip.pack(side=tk.LEFT)
+        seg_tip.bind("<Button-1>", lambda e: messagebox.showinfo("分割方法说明",
+            "v3_fallback: V3连通区域分析(带回退) - 推荐\n"
+            "lpr: 搭配识别方法:cnn_resnet18使用"))
         
         # 图片显示区域
         img_frame = tk.Frame(self.root)
@@ -127,6 +177,12 @@ class App:
         self.canvas_crop = tk.Canvas(img_frame, width=240, height=80, bg='gray')
         self.canvas_crop.grid(row=1, column=1, padx=10)
         
+        # 分割预览
+        self.lbl_seg = tk.Label(img_frame, text="字符分割预览")
+        self.lbl_seg.grid(row=0, column=2, padx=10)
+        self.canvas_seg = tk.Canvas(img_frame, width=280, height=80, bg='white')
+        self.canvas_seg.grid(row=1, column=2, padx=10)
+        
         # 结果文本
         res_frame = tk.Frame(self.root)
         res_frame.pack(pady=20, fill=tk.X, padx=20)
@@ -137,6 +193,46 @@ class App:
         
         self.current_image_path = None
         self.current_image = None
+        self.tk_seg = None  # 保持分割预览的引用
+    
+    def show_segmentation_preview(self, char_images):
+        """显示字符分割预览"""
+        if not char_images:
+            return
+        
+        # 创建拼接图像
+        target_h = 60  # 目标高度
+        total_w = 0
+        resized_chars = []
+        
+        for img in char_images:
+            if img.size == 0:
+                continue
+            h, w = img.shape[:2]
+            # 保持宽高比缩放
+            scale = target_h / h
+            new_w = max(int(w * scale), 10)
+            resized = cv2.resize(img, (new_w, target_h))
+            resized_chars.append(resized)
+            total_w += new_w + 2  # +2 for border
+        
+        if not resized_chars:
+            return
+        
+        # 创建预览图
+        preview = np.ones((target_h, total_w), dtype=np.uint8) * 255
+        x = 0
+        for i, char_img in enumerate(resized_chars):
+            w = char_img.shape[1]
+            preview[:, x:x+w] = char_img
+            x += w + 2
+        
+        # 转换为 PIL 并显示
+        preview_pil = Image.fromarray(preview)
+        preview_pil = preview_pil.resize((280, 60))
+        self.tk_seg = ImageTk.PhotoImage(preview_pil)
+        self.canvas_seg.delete("all")
+        self.canvas_seg.create_image(140, 40, image=self.tk_seg)
 
     def load_image(self):
         path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.png *.jpeg")])
@@ -195,22 +291,113 @@ class App:
                 elif 35 < mean_h < 77: color = "绿色"
                 elif 11 < mean_h < 34: color = "黄色"
             
-            # 4. LPRNet 识别
+            # 4. 车牌号识别 (根据选择的方法)
             plate_text = "模型未加载"
-            if self.lpr_model:
-                lpr_input = cv2.resize(warped, (94, 24))
-                lpr_input = lpr_input.astype('float32') / 255.0
-                lpr_input = lpr_input.transpose(2, 0, 1)
-                lpr_input = torch.tensor(lpr_input).unsqueeze(0).to(self.device)
-                
-                with torch.no_grad():
-                    output = self.lpr_model(lpr_input)
-                    plate_text = decode(output)[0]
+            confidence = 0.0
+            method = self.recognition_method.get()
+            
+            if method == "lprnet":
+                # LPRNet 端到端识别
+                if self.lpr_model:
+                    lpr_input = cv2.resize(warped, (94, 24))
+                    lpr_input = lpr_input.astype('float32') / 255.0
+                    lpr_input = lpr_input.transpose(2, 0, 1)
+                    lpr_input = torch.tensor(lpr_input).unsqueeze(0).to(self.device)
+                    
+                    with torch.no_grad():
+                        output = self.lpr_model(lpr_input)
+                        plate_text = decode(output)[0]
+                        confidence = 1.0  # LPRNet 不直接输出置信度
+                    
+                    # LPRNet 是端到端识别，也显示分割预览供参考
+                    expected_chars = 8 if color == "绿色" else 7
+                    seg_method = self.segmentation_method.get()
+                    if seg_method == "lpr":
+                        char_images = split_char(warped)
+                    else:
+                        # 默认使用 v3_fallback
+                        char_images = segment_with_fallback(warped, expected_chars)
+                    self.show_segmentation_preview(char_images)
+            
+            elif method == "cnn_resnet18":
+                # CNN ResNet18 分类识别
+                if self.cnn_recognizer:
+                    # 确定预期字符数
+                    expected_chars = 8 if color == "绿色" else 7
+                    
+                    # 根据选择的分割方法
+                    seg_method = self.segmentation_method.get()
+                    if seg_method == "lpr":
+                        # 使用 LPR 项目的分割算法
+                        char_images = split_char(warped)
+                    else:
+                        # 默认使用 V3 连通区域分析 (带回退机制)
+                        char_images = segment_with_fallback(warped, expected_chars)
+                    
+                    # 显示分割预览
+                    self.show_segmentation_preview(char_images)
+                    
+                    if len(char_images) >= 2:
+                        result = self.cnn_recognizer.recognize_with_details(char_images)
+                        plate_text = result['plate_number']
+                        confidence = result['confidence']
+                    else:
+                        plate_text = "分割失败"
+                        confidence = 0.0
+                else:
+                    plate_text = "CNN识别器未加载"
+            
+            elif method.startswith("hog_"):
+                # HOG 特征匹配
+                if hasattr(self, 'template_dir') and os.path.exists(self.template_dir):
+                    # 延迟加载 HOG 特征识别器
+                    if self.template_recognizer_deep is None:
+                        self.txt_result.insert(tk.END, "首次加载 HOG 特征识别器，请稍候...\n")
+                        self.root.update()
+                        self.template_recognizer_deep = TemplateRecognizer(self.template_dir, use_deep_feature=True)
+                    
+                    # 设置匹配方法
+                    if "euclidean" in method:
+                        self.template_recognizer_deep.set_match_method("euclidean")
+                    else:
+                        self.template_recognizer_deep.set_match_method("cosine")
+                    
+                    # 设置分割方法
+                    seg_method = self.segmentation_method.get()
+                    seg_method_map = {
+                        "v3_fallback": SegmentMethod.V3_FALLBACK,
+                        "lpr": SegmentMethod.LPR,
+                    }
+                    if seg_method in seg_method_map:
+                        self.template_recognizer_deep.set_segment_method(seg_method_map[seg_method])
+                    
+                    # 根据颜色确定车牌类型
+                    if color == "绿色":
+                        plate_type = "green"
+                    elif color == "黄色":
+                        plate_type = "220"
+                    else:
+                        plate_type = "140"
+                    
+                    result = self.template_recognizer_deep.recognize_with_details(
+                        warped, plate_type=plate_type
+                    )
+                    plate_text = result['plate_number']
+                    confidence = result['confidence']
+                    
+                    # 显示分割预览
+                    if 'char_images' in result and result['char_images']:
+                        self.show_segmentation_preview(result['char_images'])
+                else:
+                    plate_text = "HOG 识别器不可用（模板目录不存在）"
             
             # 输出结果
             info = f"车牌 {i+1}:\n"
             info += f"  号码: {plate_text}\n"
             info += f"  颜色: {color}\n"
+            info += f"  方法: {method}\n"
+            if method.startswith("hog_") or method == "cnn_resnet18":
+                info += f"  置信度: {confidence:.1%}\n"
             info += f"  字符数: {len(plate_text)}\n"
             self.txt_result.insert(tk.END, info)
 
