@@ -15,9 +15,10 @@ SIMILAR_CHARS = {
     '0': ['O', 'D'],
     'O': ['0', 'D'],
     'D': ['0', 'O'],
-    '1': ['I', 'L'],
+    '1': ['I', 'L', '7'],
     'I': ['1', 'L'],
     'L': ['1', 'I'],
+    '7': ['1', 'T'],
     '2': ['Z'],
     'Z': ['2'],
     '5': ['S'],
@@ -42,6 +43,7 @@ SIMILAR_CHARS = {
     'U': ['V'],
     'V': ['U', 'Y'],
     'Y': ['V'],
+    'T': ['7', 'Y'],
 }
 
 
@@ -87,67 +89,89 @@ class HOGFeatureExtractor:
                    feature_vector=True)
         self.feature_dim = len(feat)
     
-    def preprocess_for_matching(self, img: np.ndarray) -> np.ndarray:
+    def normalize_char(self, img: np.ndarray) -> np.ndarray:
         """
-        预处理图像以统一模板和输入的格式
-        将所有输入统一转换为高对比度的白底黑字图像
+        标准化字符图像（完整流程）：
+        1. 灰度化
+        2. 二值化（OTSU）
+        3. 反色（统一为白底黑字）
+        4. 去背景（取字符 bounding box）
+        5. 等比例缩放
+        6. 居中 + padding
         
         Args:
             img: BGR 或灰度图像
-        
+            
         Returns:
-            处理后的灰度图像（白底黑字，高对比度）
+            标准化后的图像 (target_size)
         """
-        # 转灰度
+        H, W = self.target_size  # (64, 64) -> height=64, width=64
+        
+        # 1. 灰度化
         if len(img.shape) == 3:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         else:
             gray = img.copy()
         
-        # 1. 先进行对比度增强（解决灰底灰字的问题）
-        # 使用 CLAHE（对比度受限的自适应直方图均衡化）
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-        enhanced = clahe.apply(gray)
+        # 2. OTSU 二值化
+        _, bin_img = cv2.threshold(gray, 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         
-        # 2. Otsu 二值化（自动找最佳阈值）
-        _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 3. 反色保证"白底黑字"
+        # 判断方式：如果图像平均值>127，说明白色多（背景是白色，字符是黑色）
+        # 我们需要让字符是黑色(0)，背景是白色(255)
+        # 如果当前白色像素多，说明已经是白底黑字，不需要反色
+        if np.mean(bin_img) < 127:
+            # 黑色像素多，说明是黑底白字，需要反色
+            bin_img = 255 - bin_img
         
-        # 3. 如果 Otsu 效果不好（可能是图像本身对比度太低），使用自适应二值化
-        # 检查二值化后的白色像素比例
-        white_ratio = np.sum(binary == 255) / binary.size
-        if white_ratio < 0.1 or white_ratio > 0.9:
-            # 二值化效果不好，使用自适应二值化
-            binary = cv2.adaptiveThreshold(
-                enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY, 11, 2
-            )
+        # 4. 字符区域裁剪（找到字符的 bounding box）
+        # 字符是黑色(0)，找非零像素需要反转
+        char_pixels = cv2.findNonZero(255 - bin_img)
         
-        # 4. 自动检测并修正反色：确保是白底黑字
-        h, w = binary.shape
-        # 计算边缘区域的平均值
-        edge_pixels = np.concatenate([
-            binary[:max(2, h//10), :].flatten(),      # 上边缘
-            binary[-max(2, h//10):, :].flatten(),     # 下边缘
-            binary[:, :max(2, w//10)].flatten(),      # 左边缘
-            binary[:, -max(2, w//10):].flatten()      # 右边缘
-        ])
-        edge_mean = np.mean(edge_pixels)
+        if char_pixels is None or len(char_pixels) == 0:
+            # 如果没有找到字符像素，返回白色画布
+            return np.ones((H, W), dtype=np.uint8) * 255
         
-        # 计算中心区域的平均值
-        center = binary[h//4:3*h//4, w//4:3*w//4]
-        center_mean = np.mean(center)
+        x, y, w, h = cv2.boundingRect(char_pixels)
         
-        # 如果边缘比中心暗（黑底白字），需要反色
-        if edge_mean < center_mean - 10:
-            binary = 255 - binary
+        # 防止裁剪区域太小
+        if w < 3 or h < 3:
+            return np.ones((H, W), dtype=np.uint8) * 255
         
-        # 5. 调整到目标尺寸
-        resized = cv2.resize(binary, (self.target_size[1], self.target_size[0]), 
-                            interpolation=cv2.INTER_AREA)
+        char = bin_img[y:y+h, x:x+w]
         
-        return resized
+        # 5. 等比例缩放（保留 4 像素边距）
+        padding = 4
+        scale = min((H - padding * 2) / h, (W - padding * 2) / w)
+        new_w, new_h = int(w * scale), int(h * scale)
         
-        return resized
+        # 确保尺寸至少为1
+        new_w = max(1, new_w)
+        new_h = max(1, new_h)
+        
+        resized = cv2.resize(char, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # 6. 居中置入目标框
+        canvas = np.ones((H, W), dtype=np.uint8) * 255
+        start_x = (W - new_w) // 2
+        start_y = (H - new_h) // 2
+        canvas[start_y:start_y+new_h, start_x:start_x+new_w] = resized
+        
+        return canvas
+    
+    def preprocess_for_matching(self, img: np.ndarray) -> np.ndarray:
+        """
+        预处理图像以统一模板和输入的格式
+        使用标准化流程：二值化 + 去背景 + 等比例缩放 + 居中
+        
+        Args:
+            img: BGR 或灰度图像
+        
+        Returns:
+            处理后的灰度图像（白底黑字，target_size 尺寸）
+        """
+        return self.normalize_char(img)
     
     def extract_from_numpy(self, img: np.ndarray, preprocess: bool = True) -> np.ndarray:
         """
@@ -384,6 +408,87 @@ class HOGTemplateMatcher:
         
         score = 0.0
         
+        # ========== 1 的特征检测（最关键）==========
+        # 1 是非常细窄的竖线，宽高比极小，像素集中在中间竖直区域
+        if char == '1':
+            # 计算宽高比
+            contours, _ = cv2.findContours(char_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cnt = max(contours, key=cv2.contourArea)
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                aspect = bw / (bh + 1e-6)
+                
+                # 1 的宽高比应该很小（细长）
+                if aspect < 0.35:
+                    score += 0.15
+                elif aspect < 0.45:
+                    score += 0.08
+                
+                # 1 的填充率应该较低（只有一条竖线）
+                fill_ratio = cv2.contourArea(cnt) / (bw * bh + 1e-6)
+                if fill_ratio < 0.5:
+                    score += 0.1
+            
+            # 1 的中间区域像素分布：主要集中在中心垂直带
+            mid_region = char_mask[:, w//3:2*w//3]
+            side_region = np.concatenate([char_mask[:, :w//3], char_mask[:, 2*w//3:]], axis=1)
+            
+            mid_fill = np.sum(mid_region) / (mid_region.size * 255.0 + 1e-6)
+            side_fill = np.sum(side_region) / (side_region.size * 255.0 + 1e-6)
+            
+            # 1 的特征：中间区域像素多，两侧像素少
+            if mid_fill > side_fill * 2:
+                score += 0.12
+            elif mid_fill > side_fill * 1.5:
+                score += 0.06
+                
+        # 0 的特征检测：是个闭合的椭圆/圆形
+        elif char == '0':
+            # 0 的中心应该是空的（闭合环形）
+            center_region = char_mask[h//3:2*h//3, w//3:2*w//3]
+            center_fill = np.sum(center_region) / (center_region.size * 255.0 + 1e-6)
+            
+            # 边缘应该有像素
+            edge_fill = (np.sum(char_mask) - np.sum(center_region)) / ((char_mask.size - center_region.size) * 255.0 + 1e-6)
+            
+            # 0 的特征：中心空，边缘有像素
+            if center_fill < 0.3 and edge_fill > 0.2:
+                score += 0.12
+                
+            # 宽高比检测
+            contours, _ = cv2.findContours(char_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cnt = max(contours, key=cv2.contourArea)
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                aspect = bw / (bh + 1e-6)
+                # 0 的宽高比应该在 0.5-0.8 之间
+                if 0.5 < aspect < 0.8:
+                    score += 0.08
+        
+        # W 的特征检测：顶部宽，有两个 V 形谷
+        elif char == 'W':
+            # W 的宽高比应该较大（较宽）
+            contours, _ = cv2.findContours(char_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cnt = max(contours, key=cv2.contourArea)
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                aspect = bw / (bh + 1e-6)
+                
+                # W 应该是宽的
+                if aspect > 0.8:
+                    score += 0.1
+                    
+            # W 的顶部应该有两个峰（两边高中间低）
+            top_row = char_mask[:h//4, :]
+            col_sums = np.sum(top_row, axis=0)
+            # 找峰值
+            if len(col_sums) > 4:
+                left_peak = np.max(col_sums[:w//3])
+                right_peak = np.max(col_sums[2*w//3:])
+                center_val = np.max(col_sums[w//3:2*w//3])
+                if left_peak > center_val and right_peak > center_val:
+                    score += 0.1
+        
         # 2 vs Z: 斜线方向不同
         # 2: 斜线从右上往左下弯曲（中间区域左边有像素）
         # Z: 斜线从右上往左下直线（中间区域也是右边有像素，或左右均衡）
@@ -560,6 +665,14 @@ class HOGTemplateMatcher:
         # 提取特征
         feat = self.extractor.extract_from_numpy(char_img)
         
+        # 预处理图像，用于形状分析
+        gray = self.extractor.preprocess_for_matching(char_img)
+        h, w = gray.shape
+        char_mask = 255 - gray  # 黑底白字
+        
+        # 计算基本形状特征（用于预筛选和加权）
+        shape_info = self._analyze_shape(char_mask)
+        
         # 确定候选字符集
         if is_chinese:
             candidates = set(self.chinese_features.keys())
@@ -589,18 +702,23 @@ class HOGTemplateMatcher:
         for char in candidates:
             # 使用多模板匹配：取该字符所有模板变体中的最高分
             score = self._compute_multi_template_score(feat, char, is_chinese, method)
+            
+            # 基于形状特征的加权调整
+            shape_adj = self._get_shape_adjustment(char, shape_info)
+            score = score * (1.0 + shape_adj)
+            
             scores.append((char, score))
         
         # 排序
         scores.sort(key=lambda x: x[1], reverse=True)
         
-        # 相似字符二次验证（只在前两名分数接近时）
+        # 相似字符二次验证（只在前几名分数接近时）
         if len(scores) >= 2 and not is_chinese:
             top_char, top_score = scores[0]
             second_char, second_score = scores[1]
             
-            # 分数差距小于 3%，且是相似字符
-            if top_score - second_score < 0.03:
+            # 分数差距小于 5%，进行二次验证
+            if top_score - second_score < 0.05:
                 if top_char in SIMILAR_CHARS and second_char in SIMILAR_CHARS.get(top_char, []):
                     # 使用结构特征进行调整
                     adj1 = self._get_structural_score(char_img, top_char)
@@ -611,8 +729,127 @@ class HOGTemplateMatcher:
                     
                     if new_score2 > new_score1:
                         scores[0], scores[1] = (second_char, new_score2), (top_char, new_score1)
+            
+            # 特殊处理：1 vs 0/W 的混淆（即使不在相似字符组中）
+            if top_char in ['0', 'W', 'O'] and '1' in candidates:
+                # 检查 1 是否在前几名中
+                one_score = next((s for c, s in scores if c == '1'), 0)
+                if one_score > 0:
+                    # 使用形状特征判断
+                    is_likely_one = self._is_likely_digit_one(char_mask)
+                    if is_likely_one:
+                        # 大幅提升 1 的分数
+                        scores = [(c, s + 0.3 if c == '1' else s) for c, s in scores]
+                        scores.sort(key=lambda x: x[1], reverse=True)
         
         return scores[:top_k]
+    
+    def _analyze_shape(self, char_mask: np.ndarray) -> dict:
+        """
+        分析字符形状的基本特征
+        """
+        h, w = char_mask.shape
+        info = {
+            'aspect_ratio': 1.0,
+            'fill_ratio': 0.5,
+            'center_hollow': False,
+            'is_narrow': False,
+            'is_wide': False,
+        }
+        
+        contours, _ = cv2.findContours(char_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            cnt = max(contours, key=cv2.contourArea)
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            info['aspect_ratio'] = bw / (bh + 1e-6)
+            info['fill_ratio'] = cv2.contourArea(cnt) / (bw * bh + 1e-6)
+            info['is_narrow'] = info['aspect_ratio'] < 0.4
+            info['is_wide'] = info['aspect_ratio'] > 0.9
+        
+        # 检查中心是否空心
+        center_region = char_mask[h//3:2*h//3, w//3:2*w//3]
+        center_fill = np.sum(center_region) / (center_region.size * 255.0 + 1e-6)
+        info['center_hollow'] = center_fill < 0.25
+        
+        return info
+    
+    def _get_shape_adjustment(self, char: str, shape_info: dict) -> float:
+        """
+        基于形状特征返回分数调整值
+        """
+        adj = 0.0
+        
+        # 1, I, L 应该是细窄的
+        if char in ['1', 'I', 'L', '7'] and shape_info['is_narrow']:
+            adj += 0.08
+        
+        # 0, O, D 应该有空心中心
+        if char in ['0', 'O', 'D'] and shape_info['center_hollow']:
+            adj += 0.05
+        
+        # W, M 应该是宽的
+        if char in ['W', 'M'] and shape_info['is_wide']:
+            adj += 0.05
+        
+        # 惩罚不匹配的形状
+        if char in ['1', 'I'] and shape_info['is_wide']:
+            adj -= 0.15  # 1 和 I 不应该是宽的
+        
+        if char in ['W', 'M'] and shape_info['is_narrow']:
+            adj -= 0.15  # W 和 M 不应该是窄的
+            
+        if char in ['0', 'O', 'D'] and shape_info['is_narrow']:
+            adj -= 0.1  # 0, O, D 不应该太窄
+        
+        return adj
+    
+    def _is_likely_digit_one(self, char_mask: np.ndarray) -> bool:
+        """
+        判断字符是否很可能是数字 1
+        基于多个形状特征综合判断
+        """
+        h, w = char_mask.shape
+        
+        # 1. 检查宽高比（1 应该很窄）
+        contours, _ = cv2.findContours(char_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return False
+            
+        cnt = max(contours, key=cv2.contourArea)
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        aspect = bw / (bh + 1e-6)
+        
+        # 宽高比太大，不是 1
+        if aspect > 0.5:
+            return False
+        
+        # 2. 检查像素分布（1 的像素应该集中在中间垂直带）
+        left_third = char_mask[:, :w//3]
+        middle_third = char_mask[:, w//3:2*w//3]
+        right_third = char_mask[:, 2*w//3:]
+        
+        left_fill = np.sum(left_third) / (left_third.size + 1e-6)
+        mid_fill = np.sum(middle_third) / (middle_third.size + 1e-6)
+        right_fill = np.sum(right_third) / (right_third.size + 1e-6)
+        
+        # 中间区域像素应该明显多于两侧
+        if mid_fill < left_fill + right_fill:
+            return False
+        
+        # 3. 检查是否有空心（0 有空心，1 没有）
+        center_region = char_mask[h//3:2*h//3, w//3:2*w//3]
+        center_fill = np.sum(center_region) / (center_region.size * 255.0 + 1e-6)
+        
+        # 如果中心几乎是空的，更可能是 0
+        if center_fill < 0.15:
+            return False
+        
+        # 4. 填充率检查（1 的填充率应该较低）
+        total_fill = np.sum(char_mask) / (char_mask.size * 255.0 + 1e-6)
+        if total_fill > 0.4:
+            return False
+            
+        return True
     
     def set_plate_type(self, plate_type: str):
         """切换车牌类型"""

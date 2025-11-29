@@ -73,65 +73,88 @@ class TemplateMatcher:
     def _load_and_normalize(self, filepath: str) -> Optional[np.ndarray]:
         """
         加载并归一化模板图像
+        使用标准化流程：二值化 + 去背景 + 等比例缩放 + 居中
         """
         img = cv2.imdecode(np.fromfile(filepath, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
         if img is None:
             return None
         
-        # 调整到标准尺寸
-        img = cv2.resize(img, self.TEMPLATE_SIZE)
-        
-        # 二值化处理（增强字符边缘，提高区分度）
-        # Otsu 自动阈值
-        _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 使用完整的归一化流程
+        normalized = self._normalize_char_full(img)
         
         # 归一化到 [0, 1]
-        img = binary.astype(np.float32) / 255.0
+        return normalized.astype(np.float32) / 255.0
+    
+    def _normalize_char_full(self, img: np.ndarray) -> np.ndarray:
+        """
+        完整的字符标准化流程：
+        1. 灰度化
+        2. 二值化（OTSU）
+        3. 反色（统一为白底黑字）
+        4. 去背景（取字符 bounding box）
+        5. 等比例缩放
+        6. 居中 + padding
         
-        return img
+        Args:
+            img: BGR 或灰度图像
+            
+        Returns:
+            标准化后的图像 (TEMPLATE_SIZE)
+        """
+        W, H = self.TEMPLATE_SIZE  # (20, 40) -> width=20, height=40
+        
+        # 1. 灰度化
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img.copy()
+        
+        # 2. OTSU 二值化
+        _, bin_img = cv2.threshold(gray, 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # 3. 反色保证"白底黑字"
+        # 如果黑色像素多，说明是黑底白字，需要反色
+        if np.mean(bin_img) < 127:
+            bin_img = 255 - bin_img
+        
+        # 4. 字符区域裁剪（找到字符的 bounding box）
+        char_pixels = cv2.findNonZero(255 - bin_img)
+        
+        if char_pixels is None or len(char_pixels) == 0:
+            return np.ones((H, W), dtype=np.uint8) * 255
+        
+        x, y, w, h = cv2.boundingRect(char_pixels)
+        
+        if w < 2 or h < 2:
+            return np.ones((H, W), dtype=np.uint8) * 255
+        
+        char = bin_img[y:y+h, x:x+w]
+        
+        # 5. 等比例缩放（保留 2 像素边距）
+        padding = 2
+        scale = min((H - padding * 2) / h, (W - padding * 2) / w)
+        new_w, new_h = int(w * scale), int(h * scale)
+        new_w = max(1, new_w)
+        new_h = max(1, new_h)
+        
+        resized = cv2.resize(char, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # 6. 居中置入目标框
+        canvas = np.ones((H, W), dtype=np.uint8) * 255
+        start_x = (W - new_w) // 2
+        start_y = (H - new_h) // 2
+        canvas[start_y:start_y+new_h, start_x:start_x+new_w] = resized
+        
+        return canvas
     
     def normalize_char_image(self, char_img: np.ndarray) -> np.ndarray:
         """
         归一化待识别的字符图像
-        自动检测并处理反色问题（确保与模板一致：白底黑字）
-        使用二值化增强字符形状特征
+        使用完整的标准化流程，与模板处理保持一致
         """
-        if len(char_img.shape) == 3:
-            char_img = cv2.cvtColor(char_img, cv2.COLOR_BGR2GRAY)
-        
-        # 调整到标准尺寸
-        char_img = cv2.resize(char_img, self.TEMPLATE_SIZE)
-        
-        # 二值化处理（Otsu 自动阈值）
-        _, binary = cv2.threshold(char_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # 归一化到 [0, 1]
-        char_img = binary.astype(np.float32) / 255.0
-        
-        # 自动检测并处理反色
-        # 模板是白底黑字（背景=1，字符=0）
-        # 判断方法：计算边缘像素的平均值和中心区域像素的对比
-        h, w = char_img.shape
-        
-        # 边缘区域（边框2像素）
-        edge_pixels = np.concatenate([
-            char_img[:2, :].flatten(),      # 上边
-            char_img[-2:, :].flatten(),     # 下边
-            char_img[:, :2].flatten(),      # 左边
-            char_img[:, -2:].flatten()      # 右边
-        ])
-        edge_mean = np.mean(edge_pixels)
-        
-        # 中心区域
-        center = char_img[h//4:3*h//4, w//4:3*w//4]
-        center_mean = np.mean(center)
-        
-        # 如果边缘比中心更暗，说明是黑底白字，需要反色
-        # （模板是白底黑字，边缘应该更亮）
-        if edge_mean < center_mean - 0.1:
-            char_img = 1.0 - char_img
-        
-        return char_img
+        normalized = self._normalize_char_full(char_img)
+        return normalized.astype(np.float32) / 255.0
     
     def euclidean_distance(self, img1: np.ndarray, img2: np.ndarray) -> float:
         """

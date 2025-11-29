@@ -240,7 +240,6 @@ class App:
         
         help_text = """
 【识别方法选择指南】
-
 🔹 LPRNet（推荐）
    • 基于深度学习的端到端识别
    • 适合复杂场景：监控摄像头、模糊、倾斜、光照不均
@@ -255,7 +254,7 @@ class App:
 
 📌 说明：
    • 一般场景优先使用 LPRNet
-   • HOG 方法作为实验对照选项
+   • HOG 方法作为实验对照选项(HOG+余弦相似度通常效果更好)
         """
         
         text_label = tk.Label(help_window, text=help_text, justify=tk.LEFT, 

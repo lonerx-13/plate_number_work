@@ -233,30 +233,21 @@ def merge_vertical_bboxes(bboxes: List[List[int]],
     return bboxes
 
 
-def split_wide_bboxes(bboxes: List[List[int]], 
-                      binary_img: np.ndarray, 
+def split_wide_bboxes(bboxes: List[List[int]],
+                      binary_img: np.ndarray,
                       img_height: int,
                       expected_char_width: Optional[float] = None) -> List[List[int]]:
     """
     拆分过宽的边界框（处理两个靠近的字符被识别为一个的情况）
     使用垂直投影法找到分割点，使用上半部分避免铆钉干扰
-    
-    Args:
-        bboxes: 边界框列表
-        binary_img: 二值图像
-        img_height: 图像高度
-        expected_char_width: 预期的单个字符宽度
-        
-    Returns:
-        拆分后的边界框列表
     """
     if len(bboxes) == 0:
         return bboxes
-    
+
     # 估计单个字符的平均宽度
     widths = [b[3] - b[1] for b in bboxes]
     heights = [b[2] - b[0] for b in bboxes]
-    
+
     if expected_char_width is None:
         # 过滤掉明显过宽的框，用剩余框估计正常字符宽度
         median_height = np.median(heights)
@@ -265,24 +256,24 @@ def split_wide_bboxes(bboxes: List[List[int]],
             expected_char_width = np.median(normal_widths)
         else:
             expected_char_width = median_height * 0.8
-    
+
     new_bboxes = []
-    
+
     for bbox in bboxes:
         minr, minc, maxr, maxc = bbox
         width = maxc - minc
         height = maxr - minr
-        
-        # 如果宽度超过预期字符宽度的1.4倍，尝试拆分
-        if width > expected_char_width * 1.4:
+
+        # ★ 阈值从 1.4 调低到 1.25，更积极地拆宽框
+        if width > expected_char_width * 1.25:
             num_chars = round(width / expected_char_width)
             if num_chars < 2:
                 new_bboxes.append(bbox)
                 continue
-            
+
             # 使用垂直投影法找到分割点
             roi = binary_img[minr:maxr, minc:maxc]
-            
+
             # 只使用上半部分计算投影（避免铆钉干扰）
             upper_ratio = 0.6
             upper_height = int(height * upper_ratio)
@@ -291,7 +282,7 @@ def split_wide_bboxes(bboxes: List[List[int]],
                 vertical_projection = np.sum(upper_roi, axis=0)
             else:
                 vertical_projection = np.sum(roi, axis=0)
-            
+
             # 找到分割点
             split_points = []
             for i in range(1, num_chars):
@@ -299,13 +290,13 @@ def split_wide_bboxes(bboxes: List[List[int]],
                 search_range = int(width * 0.20)
                 search_start = max(0, expected_pos - search_range)
                 search_end = min(width, expected_pos + search_range)
-                
+
                 if search_start < search_end:
                     local_proj = vertical_projection[search_start:search_end]
                     if len(local_proj) > 0:
                         min_idx = search_start + np.argmin(local_proj)
                         split_points.append(min_idx)
-            
+
             # 根据分割点创建新的边界框
             if len(split_points) > 0:
                 split_points = sorted(set(split_points))
@@ -325,8 +316,9 @@ def split_wide_bboxes(bboxes: List[List[int]],
                     new_bboxes.append([minr, start_col, maxr, end_col])
         else:
             new_bboxes.append(bbox)
-    
+
     return new_bboxes
+
 
 
 def filter_by_height(bboxes: List[List[int]], 
@@ -347,120 +339,135 @@ def filter_by_height(bboxes: List[List[int]],
     return [b for b in bboxes if (b[2] - b[0]) >= min_height]
 
 
-def segment_characters_v3(plate_img: np.ndarray, 
+def segment_characters_v3(plate_img: np.ndarray,
                           expected_chars: int = 7,
                           debug: bool = False) -> Tuple[List[np.ndarray], Optional[dict]]:
     """
     基于连通区域分析的字符分割（V3版本）
-    
-    Args:
-        plate_img: 矫正后的车牌图像 (BGR 或灰度)
-        expected_chars: 预期字符数量（普通车牌7个，新能源8个）
-        debug: 是否返回调试信息
-        
-    Returns:
-        (字符图像列表, 调试信息字典或None)
     """
     if plate_img is None or plate_img.size == 0:
         return [], None
-    
+
     h, w = plate_img.shape[:2]
-    
+
     # 1. 预处理
     gray = preprocess_for_canny(plate_img)
-    
-    # 2. Canny 边缘检测 + 膨胀（使用 sigma=3 与原始 char_spilt.py 一致）
+
+    # 2. Canny 边缘检测 + 膨胀
     edges = canny_edge_detection(gray, sigma=3.0)
-    
+
     # 3. 连通区域分析找到候选区域
     bboxes = find_connected_regions(edges, (h, w))
-    
+
     if len(bboxes) == 0:
         # 如果连通区域分析失败，尝试更小的 sigma
         edges = canny_edge_detection(gray, sigma=2.0)
         bboxes = find_connected_regions(edges, (h, w))
-    
+
     if len(bboxes) == 0:
-        # 仍然失败，返回空列表
         if debug:
             return [], {'edges': edges, 'gray': gray, 'bboxes': []}
         return [], None
-    
+
     # 4. 合并垂直方向相邻的边界框（处理汉字被拆分的问题）
     bboxes = merge_vertical_bboxes(bboxes, h)
-    
+
     # 5. 拆分过宽的边界框（处理字符粘连的问题）
     bboxes = split_wide_bboxes(bboxes, edges, h)
-    
-    # 6. 高度过滤（与 char_spilt.py 一致：高度至少是图像高度的1/4）
+
+    # 6. 高度过滤
     bboxes = filter_by_height(bboxes, h, min_height_ratio=0.25)
-    
-    # 7. 过滤边框白条（在所有处理完成后进行，避免误杀合并中的部分）
+
+    # 7. 过滤边框白条
     filtered_bboxes = []
     for bbox in bboxes:
         minr, minc, maxr, maxc = bbox
         box_w = maxc - minc
         box_h = maxr - minr
-        
-        # 边框白条特征：位于边缘 + 很窄 + 很高
+
         is_right_border = (
-            maxc > w * 0.95 and  # 太靠近右边缘
-            box_w < w * 0.04 and  # 很窄（小于4%宽度）
-            box_h > h * 0.5  # 很高（超过50%高度）
+            maxc > w * 0.95 and
+            box_w < w * 0.04 and
+            box_h > h * 0.5
         )
         is_left_border = (
-            minc < w * 0.05 and  # 太靠近左边缘
-            box_w < w * 0.04 and  # 很窄
-            box_h > h * 0.5  # 很高
+            minc < w * 0.05 and
+            box_w < w * 0.04 and
+            box_h > h * 0.5
         )
-        
+
         if is_right_border or is_left_border:
             continue
-        
+
         filtered_bboxes.append(bbox)
     bboxes = filtered_bboxes
-    
+
     # 8. 按水平位置排序
     bboxes = sorted(bboxes, key=lambda x: x[1])
-    
-    # 8. 如果分割结果数量不对，尝试调整
+
+    # ★ 8.1 分割数量明显太少时，对最宽的框再尝试拆分一次
+    if len(bboxes) < expected_chars:
+        widths = [b[3] - b[1] for b in bboxes]
+        heights = [b[2] - b[0] for b in bboxes]
+        median_height = np.median(heights)
+        normal_widths = [w0 for w0 in widths if w0 < median_height * 1.3]
+        if len(normal_widths) > 0:
+            expected_char_width = np.median(normal_widths)
+        else:
+            expected_char_width = median_height * 0.8
+
+        # 按宽度从大到小尝试拆分，直到数量接近 expected_chars
+        idx_sorted = np.argsort(widths)[::-1]
+        new_bboxes = bboxes[:]
+        for idx in idx_sorted:
+            if len(new_bboxes) >= expected_chars:
+                break
+            bbox = bboxes[idx]
+            sub_boxes = split_wide_bboxes([bbox], edges, h,
+                                          expected_char_width=expected_char_width)
+            if len(sub_boxes) > 1:
+                # 用拆分结果替换原 bbox
+                tmp = []
+                for b in new_bboxes:
+                    if b is bbox:
+                        tmp.extend(sub_boxes)
+                    else:
+                        tmp.append(b)
+                new_bboxes = tmp
+        bboxes = sorted(new_bboxes, key=lambda x: x[1])
+
+    # 8.2 如果数量太多，只取高度最大的 expected_chars 个
     if len(bboxes) > expected_chars + 2:
-        # 分割太多，按高度过滤掉一些
         heights = [(b[2] - b[0], i) for i, b in enumerate(bboxes)]
         heights.sort(reverse=True)
-        keep_indices = sorted([h[1] for h in heights[:expected_chars]])
+        keep_indices = sorted([h0[1] for h0 in heights[:expected_chars]])
         bboxes = [bboxes[i] for i in keep_indices]
-    
+
     # 9. 提取字符图像
     chars = []
-    
-    # 将灰度图转换为 uint8（0-255）供后续处理使用
+
     if gray.dtype != np.uint8:
         gray_uint8 = (gray * 255).astype(np.uint8)
     else:
         gray_uint8 = gray
-    
+
     for bbox in bboxes:
         minr, minc, maxr, maxc = bbox
         box_w = maxc - minc
         box_h = maxr - minr
-        
-        # 对于太窄的字符（如"1"），需要添加水平padding
-        # 否则 resize 到正方形后会严重变形
-        # 正常字符的宽高比约为 0.5-0.8，太窄的字符宽高比 < 0.3
+
+        # 对于太窄的字符（如 "1"），添加水平 padding
         aspect_ratio = box_w / (box_h + 1e-6)
-        
         if aspect_ratio < 0.35:
-            # 太窄，添加水平padding使宽高比至少为0.4
             target_w = int(box_h * 0.4)
             pad_w = (target_w - box_w) // 2
             minc = max(0, minc - pad_w)
             maxc = min(w, maxc + pad_w)
-        
+
         char_img = gray_uint8[minr:maxr, minc:maxc]
         if char_img.size > 0:
             chars.append(char_img)
-    
+
     debug_info = None
     if debug:
         debug_info = {
@@ -468,32 +475,27 @@ def segment_characters_v3(plate_img: np.ndarray,
             'gray': gray,
             'bboxes': bboxes
         }
-    
+
     return chars, debug_info
 
 
-def segment_with_fallback(plate_img: np.ndarray, 
+
+def segment_with_fallback(plate_img: np.ndarray,
                           expected_chars: int = 7) -> List[np.ndarray]:
     """
-    带回退机制的分割：先尝试 V3，如果失败则使用 V2 或等宽分割
-    
-    Args:
-        plate_img: 车牌图像
-        expected_chars: 预期字符数量
-        
-    Returns:
-        字符图像列表
+    带回退机制的分割：先尝试 V3，如果不可靠则使用回退方案
     """
-    # 尝试 V3 分割
+    # 先用 V3
     chars, _ = segment_characters_v3(plate_img, expected_chars)
-    
-    # 只要分割出至少2个字符，就使用V3结果
-    # 与原始 char_spilt.py 保持一致，不做过多后处理判断
-    if len(chars) >= 2:
+
+    # ★ 只有当数量在一个合理范围内时才认为 V3 成功
+    #    普通车牌一般期望 7 个，允许 ±2 的波动
+    if expected_chars - 1 <= len(chars) <= expected_chars + 2:
         return chars
-    
-    # V3 完全失败，使用等宽分割回退
+
+    # V3 结果数量明显不对，使用等宽分割回退
     return fixed_width_fallback(plate_img, expected_chars)
+
 
 
 def fixed_width_fallback(plate_img: np.ndarray, 
