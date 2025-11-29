@@ -11,14 +11,12 @@ from typing import List, Tuple, Optional
 from enum import Enum
 
 from .segment_v3 import segment_with_fallback
-from .segment_lpr import split_char
 from .matcher import TemplateMatcher, MatchMethod
 
 
 class SegmentMethod(Enum):
     """分割方法枚举"""
     V3_FALLBACK = "v3_fallback"           # V3 连通区域分析（带回退机制）- 推荐
-    LPR = "lpr"                           # LPR 项目原始分割
 
 
 class TemplateRecognizer:
@@ -108,13 +106,8 @@ class TemplateRecognizer:
         Returns:
             字符图像列表
         """
-        method = self.segment_method
-        
-        if method == SegmentMethod.LPR:
-            return split_char(plate_img)
-        else:
-            # 默认使用 V3 带回退
-            return segment_with_fallback(plate_img, expected_chars)
+        # 使用 V3 带回退机制
+        return segment_with_fallback(plate_img, expected_chars)
     
     def detect_plate_type(self, plate_img: np.ndarray) -> str:
         """

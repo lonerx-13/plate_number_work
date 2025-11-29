@@ -1,272 +1,339 @@
 """
-字符模板扩充工具
-用于从车牌识别结果中提取字符样本，扩充模板库
+字符模板库扩充脚本
+从 CCPD 数据集中提取字符样本，扩充模板库
 
-使用方法:
-1. 运行脚本，输入字符图像路径
-2. 输入正确的字符标签
-3. 脚本会自动保存为 A_1.png, A_2.png 等格式
-
-示例:
-    python expand_templates.py char_image.png A
+安全策略：
+1. 只有当分割字符数 == 真实车牌字符数时才进行扩充
+2. 每个字符保存多个变体，文件名格式: X_1.jpg, X_2.jpg, ...
+3. 可以预览待添加的字符，确认后再保存
 """
 
+import os
 import cv2
 import numpy as np
-import os
-import sys
-from pathlib import Path
+from tqdm import tqdm
+import argparse
+from collections import defaultdict
+
+# CCPD 字符映射表
+PROVINCES = ["皖", "沪", "津", "渝", "冀", "晋", "蒙", "辽", "吉", "黑", 
+             "苏", "浙", "京", "闽", "赣", "鲁", "豫", "鄂", "湘", "粤", 
+             "桂", "琼", "川", "贵", "云", "藏", "陕", "甘", "青", "宁", 
+             "新", "警", "学", "O"]
+ALPHABETS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'J', 'K', 'L', 'M', 
+             'N', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'O']
+ADS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'J', 'K', 'L', 'M', 'N', 'P', 
+       'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '0', '1', '2', '3', 
+       '4', '5', '6', '7', '8', '9', 'O']
 
 
-def get_next_template_name(template_dir: str, char: str) -> str:
-    """
-    获取下一个模板文件名
-    如果 A.png 存在，返回 A_1.png；如果 A_1.png 存在，返回 A_2.png，以此类推
-    """
-    base_path = os.path.join(template_dir, f"{char}.png")
+def parse_ccpd_filename(filename):
+    """解析 CCPD 文件名"""
+    try:
+        basename = os.path.splitext(os.path.basename(filename))[0]
+        parts = basename.split('-')
+        if len(parts) < 5:
+            return None
+        
+        plate_indices = parts[4].split('_')
+        if len(plate_indices) < 7:
+            return None
+            
+        plate_str = PROVINCES[int(plate_indices[0])]
+        plate_str += ALPHABETS[int(plate_indices[1])]
+        for idx in plate_indices[2:]:
+            plate_str += ADS[int(idx)]
+        
+        # 解析四个顶点
+        vertices_str = parts[3]
+        v_coords = vertices_str.split('_')
+        vertices = []
+        for v in v_coords:
+            vx, vy = v.split('&')
+            vertices.append([int(vx), int(vy)])
+        
+        vertices = np.array([vertices[2], vertices[3], vertices[0], vertices[1]], dtype="float32")
+        
+        return {
+            'plate_number': plate_str,
+            'vertices': vertices,
+        }
+    except:
+        return None
+
+
+def four_point_transform(image, pts, width=240, height=80):
+    """透视变换"""
+    dst = np.array([[0, 0], [width-1, 0], [width-1, height-1], [0, height-1]], dtype="float32")
+    M = cv2.getPerspectiveTransform(pts, dst)
+    warped = cv2.warpPerspective(image, M, (width, height))
+    return warped
+
+
+def get_next_template_index(char_dir, char_name):
+    """获取下一个模板编号"""
+    existing = []
+    for f in os.listdir(char_dir):
+        if f.startswith(char_name) and f.endswith(('.png', '.jpg', '.jpeg')):
+            # 解析编号: X.png -> 0, X_1.png -> 1, X_2.jpg -> 2
+            name = os.path.splitext(f)[0]
+            if name == char_name:
+                existing.append(0)
+            elif name.startswith(char_name + '_'):
+                try:
+                    idx = int(name.split('_')[1])
+                    existing.append(idx)
+                except:
+                    pass
     
-    # 如果基础模板不存在，使用基础名称
-    if not os.path.exists(base_path):
-        return base_path
-    
-    # 查找下一个可用的编号
-    idx = 1
-    while True:
-        path = os.path.join(template_dir, f"{char}_{idx}.png")
-        if not os.path.exists(path):
-            return path
-        idx += 1
+    if not existing:
+        return 0
+    return max(existing) + 1
 
 
-def preprocess_char_image(img: np.ndarray, target_size: tuple = (20, 20)) -> np.ndarray:
+def expand_templates(ccpd_root, template_dir, max_images=100, max_per_char=5, 
+                     preview=True, auto_save=False):
     """
-    预处理字符图像为标准模板格式（白底黑字）
-    
-    处理流程:
-    1. CLAHE 对比度增强（解决灰底灰字问题）
-    2. Otsu 二值化
-    3. 自动检测并转为白底黑字
-    4. 去除边缘空白，居中放置
+    从 CCPD 数据集扩充字符模板库
     
     Args:
-        img: 输入图像
-        target_size: 目标尺寸 (height, width)
-        
-    Returns:
-        处理后的二值图像（白底黑字）
+        ccpd_root: CCPD 图片目录
+        template_dir: 模板库目录
+        max_images: 最多处理的图片数
+        max_per_char: 每个字符最多添加的模板数
+        preview: 是否预览
+        auto_save: 是否自动保存（不预览）
     """
-    # 转灰度
-    if len(img.shape) == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img.copy()
+    from template_match.segment_v3 import segment_with_fallback
     
-    # 1. CLAHE 对比度增强（解决灰底灰字的问题）
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    enhanced = clahe.apply(gray)
+    chinese_dir = os.path.join(template_dir, 'chinese')
+    alpha_dir = os.path.join(template_dir, 'alphanumeric')
+    os.makedirs(chinese_dir, exist_ok=True)
+    os.makedirs(alpha_dir, exist_ok=True)
     
-    # 2. Otsu 二值化（自动找最佳阈值）
-    _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 收集图片
+    image_files = []
+    for root, _, files in os.walk(ccpd_root):
+        for f in files:
+            if f.endswith('.jpg'):
+                image_files.append(os.path.join(root, f))
     
-    # 3. 检查二值化效果，必要时使用自适应二值化
-    white_ratio = np.sum(binary == 255) / binary.size
-    if white_ratio < 0.1 or white_ratio > 0.9:
-        # 二值化效果不好，使用自适应二值化
-        binary = cv2.adaptiveThreshold(
-            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 11, 2
-        )
+    if max_images:
+        image_files = image_files[:max_images]
     
-    # 4. 自动检测并确保是白底黑字
-    h, w = binary.shape
-    # 计算边缘区域的平均值
-    edge_pixels = np.concatenate([
-        binary[:max(2, h//10), :].flatten(),      # 上边缘
-        binary[-max(2, h//10):, :].flatten(),     # 下边缘
-        binary[:, :max(2, w//10)].flatten(),      # 左边缘
-        binary[:, -max(2, w//10):].flatten()      # 右边缘
-    ])
-    edge_mean = np.mean(edge_pixels)
+    print(f"处理图片数: {len(image_files)}")
     
-    # 计算中心区域的平均值
-    center = binary[h//4:3*h//4, w//4:3*w//4]
-    center_mean = np.mean(center)
+    # 统计
+    stats = {
+        'total': 0,
+        'matched': 0,  # 字符数匹配
+        'mismatched': 0,  # 字符数不匹配
+        'added': defaultdict(int),  # 每个字符添加的数量
+    }
     
-    # 如果边缘比中心暗（黑底白字），需要反色
-    if edge_mean < center_mean - 10:
-        binary = 255 - binary
+    # 待添加的字符
+    pending_chars = defaultdict(list)  # {char: [(img, source_file), ...]}
     
-    # 5. 去除边缘空白，找到字符区域
-    coords = cv2.findNonZero(255 - binary)  # 找黑色像素（字符）
-    if coords is not None:
-        x, y, bw, bh = cv2.boundingRect(coords)
-        # 添加一点边距
-        pad = 2
-        x = max(0, x - pad)
-        y = max(0, y - pad)
-        bw = min(binary.shape[1] - x, bw + 2 * pad)
-        bh = min(binary.shape[0] - y, bh + 2 * pad)
-        binary = binary[y:y+bh, x:x+bw]
-    
-    # 6. 调整到目标尺寸（保持宽高比）
-    h, w = binary.shape
-    if h > 0 and w > 0:
-        scale = min(target_size[0] / h, target_size[1] / w) * 0.8  # 留一些边距
-        new_h, new_w = int(h * scale), int(w * scale)
-        
-        if new_h > 0 and new_w > 0:
-            resized = cv2.resize(binary, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            
-            # 创建目标大小的白色背景
-            result = np.ones(target_size, dtype=np.uint8) * 255
-            
-            # 居中放置
-            y_offset = (target_size[0] - new_h) // 2
-            x_offset = (target_size[1] - new_w) // 2
-            result[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
-            
-            return result
-    
-    return cv2.resize(binary, target_size[::-1], interpolation=cv2.INTER_AREA)
-
-
-def add_template(img_path: str, char_label: str, template_dir: str, 
-                 is_chinese: bool = False) -> str:
-    """
-    添加新的字符模板
-    
-    Args:
-        img_path: 字符图像路径
-        char_label: 字符标签（如 'A', '京'）
-        template_dir: 模板目录
-        is_chinese: 是否是汉字
-        
-    Returns:
-        保存的模板路径
-    """
-    # 读取图像
-    img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError(f"无法读取图像: {img_path}")
-    
-    # 确定保存目录
-    if is_chinese:
-        save_dir = os.path.join(template_dir, "chinese")
-    else:
-        save_dir = os.path.join(template_dir, "alphanumeric")
-    
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # 预处理
-    processed = preprocess_char_image(img)
-    
-    # 获取文件名
-    save_path = get_next_template_name(save_dir, char_label)
-    
-    # 保存
-    cv2.imencode('.png', processed)[1].tofile(save_path)
-    
-    print(f"✓ 模板已保存: {save_path}")
-    
-    # 删除旧的缓存文件
-    cache_path = os.path.splitext(save_path)[0] + "_hogv2.npy"
-    if os.path.exists(cache_path):
-        os.remove(cache_path)
-        print(f"  已删除旧缓存: {cache_path}")
-    
-    return save_path
-
-
-def interactive_mode(template_dir: str):
-    """
-    交互模式：逐个处理字符图像
-    """
-    print("=" * 50)
-    print("字符模板扩充工具 - 交互模式")
-    print("=" * 50)
-    print(f"模板目录: {template_dir}")
-    print("输入 'q' 退出")
-    print()
-    
-    while True:
-        img_path = input("请输入字符图像路径 (或 'q' 退出): ").strip()
-        
-        if img_path.lower() == 'q':
-            print("退出")
-            break
-        
-        if not os.path.exists(img_path):
-            print(f"❌ 文件不存在: {img_path}")
+    for img_path in tqdm(image_files, desc="分析中"):
+        info = parse_ccpd_filename(img_path)
+        if info is None:
             continue
         
-        # 显示图像
+        stats['total'] += 1
+        gt = info['plate_number']
+        
+        # 读取并矫正
         img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
-        if img is not None:
-            cv2.imshow("Character", img)
-            cv2.waitKey(500)
-        
-        char_label = input("请输入正确的字符标签: ").strip()
-        
-        if not char_label:
-            print("❌ 标签不能为空")
+        if img is None:
             continue
         
-        # 判断是否是汉字
-        is_chinese = len(char_label) == 1 and '\u4e00' <= char_label <= '\u9fff'
+        warped = four_point_transform(img, info['vertices'])
         
-        try:
-            add_template(img_path, char_label, template_dir, is_chinese)
-        except Exception as e:
-            print(f"❌ 错误: {e}")
+        # 分割字符
+        char_images = segment_with_fallback(warped, len(gt))
         
-        print()
+        # 关键检查：字符数必须匹配
+        if len(char_images) != len(gt):
+            stats['mismatched'] += 1
+            continue
+        
+        stats['matched'] += 1
+        
+        # 收集字符
+        for i, (char_img, char_label) in enumerate(zip(char_images, gt)):
+            # 检查是否需要更多模板
+            if i == 0:
+                # 汉字
+                char_dir = chinese_dir
+            else:
+                # 字母数字
+                char_dir = alpha_dir
+            
+            # 检查当前模板数量
+            current_count = len([f for f in os.listdir(char_dir) 
+                               if f.startswith(char_label) and f.endswith(('.png', '.jpg', '.jpeg'))])
+            
+            if current_count < max_per_char:
+                # 还需要更多模板
+                if len(pending_chars[char_label]) < max_per_char - current_count:
+                    pending_chars[char_label].append((char_img, os.path.basename(img_path)))
     
-    cv2.destroyAllWindows()
+    print(f"\n统计:")
+    print(f"  总图片: {stats['total']}")
+    print(f"  字符数匹配: {stats['matched']} ({stats['matched']/max(stats['total'],1)*100:.1f}%)")
+    print(f"  字符数不匹配: {stats['mismatched']}")
+    print(f"  待添加字符种类: {len(pending_chars)}")
+    
+    if not pending_chars:
+        print("\n没有需要添加的新模板")
+        return
+    
+    # 显示待添加的字符
+    print(f"\n待添加的字符模板:")
+    for char, samples in sorted(pending_chars.items()):
+        print(f"  '{char}': {len(samples)} 个样本")
+    
+    if preview and not auto_save:
+        # 预览模式：显示每个字符的样本
+        print("\n预览模式 - 按 's' 保存当前字符，'n' 跳过，'q' 退出")
+        
+        for char, samples in sorted(pending_chars.items()):
+            if not samples:
+                continue
+            
+            # 创建预览图
+            preview_imgs = []
+            for char_img, source in samples:
+                # 确保是彩色图
+                if len(char_img.shape) == 2:
+                    char_img = cv2.cvtColor(char_img, cv2.COLOR_GRAY2BGR)
+                
+                # 调整大小便于显示
+                h, w = char_img.shape[:2]
+                scale = 80 / h
+                resized = cv2.resize(char_img, (int(w * scale), 80))
+                
+                # 添加边框
+                bordered = cv2.copyMakeBorder(resized, 2, 2, 2, 2, 
+                                             cv2.BORDER_CONSTANT, value=(0, 255, 0))
+                preview_imgs.append(bordered)
+            
+            # 拼接
+            max_w = max(img.shape[1] for img in preview_imgs)
+            padded = []
+            for img in preview_imgs:
+                # 确保是3通道
+                if len(img.shape) == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                if img.shape[1] < max_w:
+                    pad = np.ones((img.shape[0], max_w - img.shape[1], 3), dtype=np.uint8) * 255
+                    img = np.hstack([img, pad])
+                padded.append(img)
+            
+            combined = np.vstack(padded) if len(padded) > 1 else padded[0]
+            
+            # 确定保存目录
+            if char in PROVINCES:
+                char_dir = chinese_dir
+            else:
+                char_dir = alpha_dir
+            
+            # 显示预览窗口
+            window_name = f"Char '{char}' - {len(samples)} samples"
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.imshow(window_name, combined)
+            
+            print(f"\n当前字符: '{char}' ({len(samples)} 个样本)")
+            print("  按 's' 保存, 'n' 跳过, 'q' 退出 (请先点击图片窗口)")
+            
+            # 等待按键，超时后也继续
+            while True:
+                key = cv2.waitKey(100) & 0xFF
+                if key == ord('s') or key == ord('S'):
+                    # 保存
+                    for char_img, source in samples:
+                        idx = get_next_template_index(char_dir, char)
+                        if idx == 0:
+                            save_name = f"{char}.jpg"
+                        else:
+                            save_name = f"{char}_{idx}.jpg"
+                        save_path = os.path.join(char_dir, save_name)
+                        cv2.imencode('.jpg', char_img)[1].tofile(save_path)
+                        stats['added'][char] += 1
+                    print(f"  ✓ 已保存 '{char}': {len(samples)} 个模板")
+                    break
+                elif key == ord('n') or key == ord('N'):
+                    print(f"  - 跳过 '{char}'")
+                    break
+                elif key == ord('q') or key == ord('Q'):
+                    print("退出预览")
+                    cv2.destroyAllWindows()
+                    return
+                elif key == 27:  # ESC
+                    print("退出预览")
+                    cv2.destroyAllWindows()
+                    return
+            
+            cv2.destroyAllWindows()
+    
+    elif auto_save:
+        # 自动保存模式
+        print("\n自动保存模式...")
+        for char, samples in pending_chars.items():
+            if char in PROVINCES:
+                char_dir = chinese_dir
+            else:
+                char_dir = alpha_dir
+            
+            for char_img, source in samples:
+                idx = get_next_template_index(char_dir, char)
+                if idx == 0:
+                    save_name = f"{char}.jpg"
+                else:
+                    save_name = f"{char}_{idx}.jpg"
+                save_path = os.path.join(char_dir, save_name)
+                cv2.imencode('.jpg', char_img)[1].tofile(save_path)
+                stats['added'][char] += 1
+        
+        print(f"已保存 {sum(stats['added'].values())} 个新模板")
+    
+    # 最终统计
+    if stats['added']:
+        print(f"\n添加的模板:")
+        for char, count in sorted(stats['added'].items()):
+            print(f"  '{char}': +{count}")
 
 
-def batch_mode(template_dir: str, char_dir: str, char_label: str):
-    """
-    批量模式：处理一个目录下的所有图像
+def main():
+    parser = argparse.ArgumentParser(description='从 CCPD 扩充字符模板库')
+    parser.add_argument('--ccpd_root', type=str, required=True,
+                        help='CCPD 图片目录')
+    parser.add_argument('--template_dir', type=str, default='./character',
+                        help='模板库目录')
+    parser.add_argument('--max_images', type=int, default=100,
+                        help='最多处理的图片数')
+    parser.add_argument('--max_per_char', type=int, default=5,
+                        help='每个字符最多保留的模板数')
+    parser.add_argument('--auto', action='store_true',
+                        help='自动保存模式（不预览）')
+    parser.add_argument('--no_preview', action='store_true',
+                        help='只分析不保存')
     
-    Args:
-        template_dir: 模板目录
-        char_dir: 字符图像目录
-        char_label: 字符标签
-    """
-    is_chinese = len(char_label) == 1 and '\u4e00' <= char_label <= '\u9fff'
+    args = parser.parse_args()
     
-    count = 0
-    for filename in os.listdir(char_dir):
-        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
-            img_path = os.path.join(char_dir, filename)
-            try:
-                add_template(img_path, char_label, template_dir, is_chinese)
-                count += 1
-            except Exception as e:
-                print(f"❌ 处理失败 {filename}: {e}")
+    if not os.path.exists(args.ccpd_root):
+        print(f"目录不存在: {args.ccpd_root}")
+        return
     
-    print(f"\n共添加 {count} 个模板")
+    expand_templates(
+        args.ccpd_root,
+        args.template_dir,
+        max_images=args.max_images,
+        max_per_char=args.max_per_char,
+        preview=not args.no_preview,
+        auto_save=args.auto
+    )
 
 
 if __name__ == "__main__":
-    # 默认模板目录
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    template_dir = os.path.join(script_dir, "character")
-    
-    if len(sys.argv) == 1:
-        # 交互模式
-        interactive_mode(template_dir)
-    elif len(sys.argv) == 3:
-        # 单个文件模式: python expand_templates.py image.png A
-        img_path = sys.argv[1]
-        char_label = sys.argv[2]
-        is_chinese = len(char_label) == 1 and '\u4e00' <= char_label <= '\u9fff'
-        add_template(img_path, char_label, template_dir, is_chinese)
-    elif len(sys.argv) == 4 and sys.argv[1] == '--batch':
-        # 批量模式: python expand_templates.py --batch dir/ A
-        batch_mode(template_dir, sys.argv[2], sys.argv[3])
-    else:
-        print("用法:")
-        print("  交互模式:  python expand_templates.py")
-        print("  单文件:    python expand_templates.py image.png A")
-        print("  批量模式:  python expand_templates.py --batch char_dir/ A")
+    main()
