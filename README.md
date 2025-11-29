@@ -74,12 +74,7 @@ plate_number_work/
 │
 ├── utils/                  # 工具函数
 ├── Pose/                   # 姿态估计相关
-│
-├── analyze_hog.py          # HOG 匹配分析脚本
-├── test_ccpd.py            # CCPD 数据集测试脚本
-├── expand_templates.py     # 模板库扩充脚本
-├── train_pose.py           # 姿态模型训练脚本
-└── ccpd_to_yolo_pose.py    # CCPD 数据集转换脚本
+└── train_pose.py           # 姿态模型训练脚本
 ```
 
 ## 识别方法对比
@@ -89,15 +84,6 @@ plate_number_work/
 | LPRNet | 端到端深度学习 | 准确率高、鲁棒性强、速度快 | 需要 GPU 加速 | 复杂场景、实时识别 |
 | HOG 模板匹配 | 特征提取 + 模板比对 | 可解释性强、无需训练 | 对图片质量要求高 | 高清图片、离线识别 |
 
-## 字符分割（V3）
-
-HOG 模板匹配使用 V3 分割算法：
-
-1. **Canny 边缘检测**：获取字符边界
-2. **连通区域分析**：提取候选字符区域
-3. **智能合并**：处理汉字被分割成上下两部分的情况
-4. **智能拆分**：处理两个靠近的字符被识别为一个的情况
-5. **上半部分投影**：避免铆钉干扰
 
 ## 技术栈
 
@@ -106,7 +92,3 @@ HOG 模板匹配使用 V3 分割算法：
 - **图像处理**：OpenCV, scikit-image
 - **GUI**：Tkinter
 - **特征提取**：HOG (skimage)
-
-## License
-
-MIT License
